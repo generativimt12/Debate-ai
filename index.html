@@ -30,6 +30,12 @@
       .bar:nth-child(4) { animation-delay: -0.6s; }
       
       body { fontFamily: 'system-ui, -apple-system, sans-serif' }
+      
+      /* עיצוב פס גלילה מותאם */
+      .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+      .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+      .scrollbar-thin::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 20px; }
+      .scrollbar-dark::-webkit-scrollbar-thumb { background-color: #475569; }
     </style>
 </head>
 <body>
@@ -38,40 +44,71 @@
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
 
-        // --- API Services ---
+        // --- שירותי API משופרים עם דיווח שגיאות אונליין ---
         const callGeminiAPI = async (apiKey, systemPrompt, userPrompt) => {
           const activeKey = apiKey.trim() || "";
-          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${activeKey}`;
+          if (!activeKey) throw new Error("שגיאה מוקדמת: לא הוזן מפתח API. אנא הוסף בהגדרות.");
+
+          // שימוש במודל יציב וקיים
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeKey}`;
 
           const payload = {
             systemInstruction: { parts: [{ text: systemPrompt }] },
             contents: [{ parts: [{ text: userPrompt }] }]
           };
 
-          const retries = [1000, 2000, 4000, 8000, 16000];
-          let attempt = 0;
+          try {
+            const response = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
 
-          while (attempt <= retries.length) {
-            try {
-              const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-              });
-
-              if (!response.ok) throw new Error(`API Error: ${response.status}`);
-              const data = await response.json();
-              const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-              if (!text) throw new Error("No text returned from API");
-              return text;
-            } catch (error) {
-              if (attempt < retries.length) {
-                await new Promise(resolve => setTimeout(resolve, retries[attempt]));
-                attempt++;
-              } else {
-                throw new Error("שגיאת תקשורת מול ה-API. אנא בדוק את החיבור או את מפתח ה-API.");
-              }
+            if (!response.ok) {
+              // חילוץ הודעת השגיאה המדויקת מהשרת
+              const errorData = await response.json().catch(() => ({}));
+              const detailedError = errorData?.error?.message || response.statusText || "שגיאה לא ידועה";
+              throw new Error(`קוד שגיאה מגוגל (${response.status}): ${detailedError}`);
             }
+            
+            const data = await response.json();
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error("התקבלה תשובה מגוגל אך היא אינה מכילה טקסט תקין.");
+            return text;
+          } catch (error) {
+            console.error("API Debug Error:", error);
+            throw error; 
+          }
+        };
+
+        const callTTSAPI = async (apiKey, text, voiceName) => {
+          const activeKey = apiKey.trim() || "";
+          if (!activeKey) throw new Error("לא הוזן מפתח API למערכת הדיבור.");
+          
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeKey}`;
+          
+          try {
+            const response = await fetch(url, { 
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: text }] }],
+                generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } } } }
+              }) 
+            });
+            
+            if (!response.ok) {
+              const errorData = await response.json().catch(() => ({}));
+              const detailedError = errorData?.error?.message || response.statusText || "שגיאה לא ידועה";
+              throw new Error(`שגיאת מערכת דיבור (${response.status}): ${detailedError}`);
+            }
+            
+            const data = await response.json();
+            const audioData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (!audioData) throw new Error("מערכת הדיבור לא החזירה קובץ שמע.");
+            return audioData;
+          } catch (error) {
+            console.error("TTS API Debug Error:", error);
+            throw error;
           }
         };
 
@@ -97,21 +134,6 @@
           let offset = 44;
           for (let i = 0; i < pcm16View.length; i++) { view.setInt16(offset, pcm16View[i], true); offset += 2; }
           return new Blob([buffer], { type: 'audio/wav' });
-        };
-
-        const callTTSAPI = async (apiKey, text, voiceName) => {
-          const activeKey = apiKey.trim() || "";
-          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${activeKey}`;
-          const response = await fetch(url, { 
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, 
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: text }] }],
-              generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } } } }
-            }) 
-          });
-          if (!response.ok) throw new Error("שגיאה במערכת הדיבור");
-          const data = await response.json();
-          return data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         };
 
         function App() {
@@ -262,10 +284,14 @@
             if (!enableFactCheck) return;
             setCurrentAction(`בודק עובדות (${speakerName})...`);
             const prompt = `קרא את הטקסט הבא: "${text}".\nהאם יש בו טענה עובדתית מובהקת שהיא שקרית לחלוטין או מטעה מאוד? (דעות מותרות, רק שקרים מוחלטים פסולים).\nאם אין שקר מובהק, ענה בדיוק במילה אחת באנגלית: OK.\nאם יש שקר, ענה בקצרה (עד 20 מילים) שמתחילה במילה "שקר:" והסבר את האמת.`;
-            const resp = await callGeminiAPI(apiKey, "אתה סוכן בדיקת עובדות קפדן ואובייקטיבי.", prompt);
-            if (!resp.trim().toUpperCase().startsWith('OK')) {
-                messagesRef.current = [...messagesRef.current, { id: Date.now()+Math.random(), speaker: 'סוכן בדיקת עובדות', role: 'fact_check', text: resp }];
-                setMessages([...messagesRef.current]);
+            try {
+              const resp = await callGeminiAPI(apiKey, "אתה סוכן בדיקת עובדות קפדן ואובייקטיבי.", prompt);
+              if (!resp.trim().toUpperCase().startsWith('OK')) {
+                  messagesRef.current = [...messagesRef.current, { id: Date.now()+Math.random(), speaker: 'סוכן בדיקת עובדות', role: 'fact_check', text: resp }];
+                  setMessages([...messagesRef.current]);
+              }
+            } catch (e) {
+              console.warn("Fact check failed:", e);
             }
           };
 
@@ -287,6 +313,7 @@
                     setCurrentAction(`סיבוב ${round}: ממתין לתשובה מ-${currentBot.name}...`);
                     
                     let prompt = `הנושא: ${topic}\n\nהיסטוריית הדיבייט:\n${getTranscript(messagesRef.current) || 'אין, אתה פותח.'}\n\nתורך לדבר בתור ${currentBot.name}. ${i > 0 ? 'הפרך את קודמיך במידת הצורך.' : ''} עד ${wordLimit} מילים.${rulesText}${instructionNotice}`;
+                    
                     let resp = await callGeminiAPI(apiKey, currentBot.persona, prompt);
                     
                     await checkPause(); if (cancelDebateRef.current) break;
@@ -295,8 +322,12 @@
 
                     if (enableAudio) {
                        setCurrentAction(`${currentBot.name} מדבר/ת...`);
-                       const audioData = await callTTSAPI(apiKey, resp, currentBot.voice);
-                       await playAudioAndWait(audioData, currentBot.id);
+                       try {
+                         const audioData = await callTTSAPI(apiKey, resp, currentBot.voice);
+                         await playAudioAndWait(audioData, currentBot.id);
+                       } catch (e) {
+                         console.warn("Audio generation failed:", e);
+                       }
                     }
                     await checkFacts(resp, currentBot.name);
                 }
@@ -315,8 +346,12 @@
 
                     if (enableAudio) {
                        setCurrentAction(`השופט מכריז על התוצאות...`);
-                       const audioData = await callTTSAPI(apiKey, resp3, "Zephyr");
-                       await playAudioAndWait(audioData, 'judge');
+                       try {
+                         const audioData = await callTTSAPI(apiKey, resp3, "Zephyr");
+                         await playAudioAndWait(audioData, 'judge');
+                       } catch (e) {
+                         console.warn("Judge audio failed:", e);
+                       }
                     }
                 }
               }
@@ -385,7 +420,7 @@
                 <main className="flex-1 flex flex-col relative">
                   
                   <div className={`absolute top-0 left-0 right-0 bg-white shadow-2xl border-b border-gray-200 z-30 transition-transform duration-300 transform origin-top ${showSettings ? 'scale-y-100 opacity-100' : 'scale-y-0 opacity-0 h-0 overflow-hidden'} text-gray-800`}>
-                    <div className="p-6 max-h-[70vh] overflow-y-auto">
+                    <div className="p-6 max-h-[70vh] overflow-y-auto scrollbar-thin">
                       <div className="flex justify-between items-center border-b pb-3 mb-4">
                          <h2 className="text-xl font-bold flex items-center gap-2">⚙️ תצורת הזירה</h2>
                       </div>
@@ -439,7 +474,7 @@
 
                           <div>
                             <label className="block text-sm font-bold mb-1 flex items-center gap-2">🔑 מפתח API</label>
-                            <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="השאר ריק אם מוגדר בסביבה"
+                            <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="הכנס את המפתח שלך כאן"
                               className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none font-mono text-xs" />
                           </div>
                         </div>
@@ -510,12 +545,12 @@
                      </div>
                   </div>
 
-                  <div ref={chatContainerRef} className={`flex-1 overflow-y-auto p-4 md:p-8 space-y-8 ${theme === 'cyber' ? 'scrollbar-dark' : ''}`}>
+                  <div ref={chatContainerRef} className={`flex-1 overflow-y-auto p-4 md:p-8 space-y-8 scrollbar-thin ${theme === 'cyber' ? 'scrollbar-dark' : ''}`}>
                     {messages.length === 0 && debateState === 'idle' && (
                       <div className="h-full flex flex-col items-center justify-center opacity-40">
                         <span className="text-6xl mb-6">⚖️</span>
                         <h2 className="text-2xl font-bold mb-2">הזירה מוכנה</h2>
-                        <p className="text-lg text-center max-w-md">הגדר את הדמויות והנושא בחלונית ההגדרות, ולחץ על התחל דיבייט כשתהיה מוכן.</p>
+                        <p className="text-lg text-center max-w-md">הגדר את הדמויות והנושא בחלונית ההגדרות, הזן מפתח API, ולחץ על התחל דיבייט כשתהיה מוכן.</p>
                       </div>
                     )}
                     
@@ -563,9 +598,12 @@
                     )})}
                     
                     {errorMsg && (
-                      <div className="bg-red-100 border-2 border-red-400 text-red-800 p-4 rounded-xl flex items-center gap-3 shadow-lg mx-auto max-w-2xl">
+                      <div className="bg-red-100 border-2 border-red-400 text-red-800 p-4 rounded-xl flex items-center gap-3 shadow-lg mx-auto max-w-2xl mt-4">
                          <span className="text-3xl shrink-0">🚨</span>
-                         <p className="font-bold">{errorMsg}</p>
+                         <div className="flex-1">
+                           <p className="font-bold mb-1">התרחשה שגיאה בתקשורת עם שרתי ה-AI:</p>
+                           <p className="text-sm font-mono bg-white/50 p-2 rounded border border-red-200" dir="ltr">{errorMsg}</p>
+                         </div>
                       </div>
                     )}
                   </div>
@@ -602,7 +640,7 @@
                           onClick={runDebate}
                           className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-blue-600 text-white px-8 py-3 rounded-xl hover:bg-blue-700 transition-all font-bold shadow-lg"
                         >
-                          ▶️ התחל דיבייט חדש
+                          ▶️ התחל דיבייט
                         </button>
                       ) : (
                         <>
