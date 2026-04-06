@@ -1,0 +1,633 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Play, Square, Settings, User, Key, Users, MessageSquare, ShieldAlert, Volume2, VolumeX, Pause, Navigation, Download, Activity, Scale, Cpu, CheckCircle, Plus, Trash2, Image as ImageIcon, RotateCcw } from 'lucide-react';
+
+// --- סגנונות גל דיבור (Visualizer) ---
+const styleSheet = document.createElement("style");
+styleSheet.innerText = `
+  @keyframes equalize {
+    0% { height: 4px; }
+    50% { height: 16px; }
+    100% { height: 4px; }
+  }
+  .bar {
+    width: 4px;
+    background-color: currentColor;
+    border-radius: 2px;
+    animation: equalize 1s infinite;
+  }
+  .bar:nth-child(1) { animation-delay: -0.4s; }
+  .bar:nth-child(2) { animation-delay: -0.2s; }
+  .bar:nth-child(3) { animation-delay: 0s; }
+  .bar:nth-child(4) { animation-delay: -0.6s; }
+`;
+document.head.appendChild(styleSheet);
+
+// --- שירותי API ---
+const callGeminiAPI = async (apiKey, systemPrompt, userPrompt) => {
+  const activeKey = apiKey.trim() || "";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${activeKey}`;
+
+  const payload = {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ parts: [{ text: userPrompt }] }]
+  };
+
+  const retries = [1000, 2000, 4000, 8000, 16000];
+  let attempt = 0;
+
+  while (attempt <= retries.length) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) throw new Error(`API Error: ${response.status}`);
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error("No text returned from API");
+      return text;
+    } catch (error) {
+      if (attempt < retries.length) {
+        await new Promise(resolve => setTimeout(resolve, retries[attempt]));
+        attempt++;
+      } else {
+        throw new Error("שגיאת תקשורת מול ה-API. אנא בדוק את החיבור או את מפתח ה-API.");
+      }
+    }
+  }
+};
+
+const pcmToWav = (pcmData, sampleRate = 24000) => {
+  const binaryString = atob(pcmData);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+  const buffer = new ArrayBuffer(44 + bytes.buffer.byteLength);
+  const view = new DataView(buffer);
+  
+  const writeString = (view, offset, string) => {
+    for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+  };
+  
+  writeString(view, 0, 'RIFF'); view.setUint32(4, 36 + bytes.buffer.byteLength, true);
+  writeString(view, 8, 'WAVE'); writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeString(view, 36, 'data'); view.setUint32(40, bytes.buffer.byteLength, true);
+  
+  const pcm16View = new Int16Array(bytes.buffer);
+  let offset = 44;
+  for (let i = 0; i < pcm16View.length; i++) { view.setInt16(offset, pcm16View[i], true); offset += 2; }
+  return new Blob([buffer], { type: 'audio/wav' });
+};
+
+const callTTSAPI = async (apiKey, text, voiceName) => {
+  const activeKey = apiKey.trim() || "";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${activeKey}`;
+  const response = await fetch(url, { 
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: text }] }],
+      generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } } } }
+    }) 
+  });
+  if (!response.ok) throw new Error("שגיאה במערכת הדיבור");
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+};
+
+// --- קומפוננטת האפליקציה ---
+export default function App() {
+  const [apiKey, setApiKey] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+  
+  // הגדרות מתקדמות
+  const [topic, setTopic] = useState('האם למידה מרחוק עדיפה על פני למידה פיזית בכיתה?');
+  const [maxTurns, setMaxTurns] = useState(3);
+  const [wordLimit, setWordLimit] = useState(80);
+  const [customRules, setCustomRules] = useState('');
+  const [enableAudio, setEnableAudio] = useState(false);
+  const [enableFactCheck, setEnableFactCheck] = useState(true);
+  const [theme, setTheme] = useState('classic'); // classic, academic, cyber
+  
+  const defaultBots = [
+    { id: 'bot1', name: 'פרופסור אקדמי', persona: 'אתה אקדמאי שמרן הדוגל בלמידה מסורתית. הטיעונים שלך מבוססים על חשיבות המסגרת והמשמעת.', voice: 'Aoede', avatar: '', colorIndex: 0 },
+    { id: 'bot2', name: 'ד"ר טכנולוגיה', persona: 'אתה מומחה לחדשנות שמאמין שלמידה מרחוק היא העתיד. אתה מדגיש יעילות והתאמה אישית.', voice: 'Fenrir', avatar: '', colorIndex: 1 }
+  ];
+  const [bots, setBots] = useState(defaultBots);
+
+  const [debateState, setDebateState] = useState('idle');
+  const [isPaused, setIsPaused] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [currentAction, setCurrentAction] = useState('מוכן להתחיל...');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [userInput, setUserInput] = useState('');
+  const [currentRound, setCurrentRound] = useState(0);
+  const [speakingBot, setSpeakingBot] = useState(null); // זיהוי מי מדבר כרגע לאנימציה
+  
+  const chatContainerRef = useRef(null);
+  const cancelDebateRef = useRef(false);
+  const pausedRef = useRef(false);
+  const currentAudioRef = useRef(null);
+  const messagesRef = useRef([]);
+
+  // --- שמירה ושחזור מזכרון הדפדפן ---
+  useEffect(() => {
+    const savedData = localStorage.getItem('debateAppState');
+    if (savedData) {
+      try {
+        const parsed = JSON.parse(savedData);
+        if (parsed.topic) setTopic(parsed.topic);
+        if (parsed.maxTurns) setMaxTurns(parsed.maxTurns);
+        if (parsed.wordLimit) setWordLimit(parsed.wordLimit);
+        if (parsed.customRules) setCustomRules(parsed.customRules);
+        if (parsed.theme) setTheme(parsed.theme);
+        if (parsed.bots) setBots(parsed.bots);
+        if (parsed.messages && parsed.messages.length > 0) {
+          setMessages(parsed.messages);
+          messagesRef.current = parsed.messages;
+          setDebateState('finished'); // הצגת ההיסטוריה השמורה
+        }
+      } catch (e) {
+        console.error("Failed to parse local storage", e);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (debateState !== 'idle') {
+      const dataToSave = { topic, maxTurns, wordLimit, customRules, theme, bots, messages };
+      localStorage.setItem('debateAppState', JSON.stringify(dataToSave));
+    }
+  }, [topic, maxTurns, wordLimit, customRules, theme, bots, messages, debateState]);
+
+  const clearHistory = () => {
+    setMessages([]);
+    messagesRef.current = [];
+    setDebateState('idle');
+    localStorage.removeItem('debateAppState');
+  };
+
+  const addBot = () => {
+    const newBot = {
+      id: `bot${Date.now()}`,
+      name: `דובר ${bots.length + 1}`,
+      persona: 'הגדר אישיות חדשה...',
+      voice: 'Kore',
+      avatar: '',
+      colorIndex: bots.length
+    };
+    setBots([...bots, newBot]);
+  };
+
+  const removeBot = (id) => {
+    if (bots.length <= 2) return; // מינימום 2 דוברים
+    setBots(bots.filter(b => b.id !== id));
+  };
+
+  const updateBot = (id, field, value) => {
+    setBots(bots.map(b => b.id === id ? { ...b, [field]: value } : b));
+  };
+
+  useEffect(() => {
+    if (chatContainerRef.current) chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+  }, [messages, currentAction]);
+
+  const togglePause = () => {
+    pausedRef.current = !pausedRef.current;
+    setIsPaused(pausedRef.current);
+    setCurrentAction(pausedRef.current ? 'הדיבייט מושהה. תוכל לשלוח הנחיות...' : 'חוזר לדיבייט...');
+    setDebateState(pausedRef.current ? 'paused' : 'running');
+  };
+
+  const handleSendUserMessage = () => {
+    if (!userInput.trim()) return;
+    const newMsg = { id: Date.now(), speaker: 'הקהל / מנחה', role: 'user_moderator', text: userInput };
+    messagesRef.current = [...messagesRef.current, newMsg];
+    setMessages([...messagesRef.current]);
+    setUserInput('');
+  };
+
+  const exportTranscript = () => {
+    const textData = messages.map(m => `[${m.speaker}]:\n${m.text}\n`).join('\n------------------------\n\n');
+    const blob = new Blob([`נושא הדיבייט: ${topic}\n\n${textData}`], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Debate_Transcript_${new Date().toISOString().slice(0,10)}.txt`;
+    link.click();
+  };
+
+  const playAudioAndWait = (pcmBase64, botId) => {
+    return new Promise((resolve) => {
+        if (cancelDebateRef.current) return resolve();
+        try {
+            const wavBlob = pcmToWav(pcmBase64, 24000);
+            const audio = new Audio(URL.createObjectURL(wavBlob));
+            currentAudioRef.current = audio;
+            setSpeakingBot(botId);
+            
+            const onEnd = () => { setSpeakingBot(null); resolve(); };
+            audio.onended = onEnd;
+            audio.onerror = onEnd;
+            audio.addEventListener('stop-debate', onEnd);
+            audio.play().catch(() => onEnd()); 
+        } catch(e) {
+           setSpeakingBot(null);
+           resolve();
+        }
+    });
+  };
+
+  const checkPause = async () => {
+    while (pausedRef.current && !cancelDebateRef.current) await new Promise(r => setTimeout(r, 200));
+  };
+
+  const checkFacts = async (text, speakerName) => {
+    if (!enableFactCheck) return;
+    setCurrentAction(`בודק עובדות (${speakerName})...`);
+    const prompt = `קרא את הטקסט הבא: "${text}".\nהאם יש בו טענה עובדתית מובהקת שהיא שקרית לחלוטין או מטעה מאוד? (דעות מותרות, רק שקרים מוחלטים פסולים).\nאם אין שקר מובהק, ענה בדיוק במילה אחת באנגלית: OK.\nאם יש שקר, ענה בקצרה (עד 20 מילים) שמתחילה במילה "שקר:" והסבר את האמת.`;
+    const resp = await callGeminiAPI(apiKey, "אתה סוכן בדיקת עובדות קפדן ואובייקטיבי.", prompt);
+    if (!resp.trim().toUpperCase().startsWith('OK')) {
+        messagesRef.current = [...messagesRef.current, { id: Date.now()+Math.random(), speaker: 'סוכן בדיקת עובדות', role: 'fact_check', text: resp }];
+        setMessages([...messagesRef.current]);
+    }
+  };
+
+  const runDebate = async () => {
+    setDebateState('running'); setIsPaused(false); pausedRef.current = false; cancelDebateRef.current = false;
+    setErrorMsg(''); messagesRef.current = []; setMessages([]); setCurrentRound(0);
+
+    const getTranscript = (msgs) => msgs.map(m => `${m.speaker}: ${m.text}`).join('\n\n');
+
+    try {
+      for (let round = 1; round <= maxTurns; round++) {
+        setCurrentRound(round);
+        const rulesText = customRules.trim() ? `\n\nחובה לציית לכללים:\n${customRules}` : '';
+        const instructionNotice = "\nפתח את דבריך באמוג'י יחיד המייצג את הרגש שלך (למשל 😡, 🤔, 💡). התייחס תמיד להנחיות המנחה אם ישנן בהיסטוריה.";
+
+        // מעבר על כל הדוברים בפאנל
+        for (let i = 0; i < bots.length; i++) {
+            const currentBot = bots[i];
+            await checkPause(); if (cancelDebateRef.current) break;
+            setCurrentAction(`סיבוב ${round}: ממתין לתשובה מ-${currentBot.name}...`);
+            
+            let prompt = `הנושא: ${topic}\n\nהיסטוריית הדיבייט:\n${getTranscript(messagesRef.current) || 'אין, אתה פותח.'}\n\nתורך לדבר בתור ${currentBot.name}. ${i > 0 ? 'הפרך את קודמיך במידת הצורך.' : ''} עד ${wordLimit} מילים.${rulesText}${instructionNotice}`;
+            let resp = await callGeminiAPI(apiKey, currentBot.persona, prompt);
+            
+            await checkPause(); if (cancelDebateRef.current) break;
+            messagesRef.current = [...messagesRef.current, { id: Date.now(), speaker: currentBot.name, role: currentBot.id, text: resp, avatar: currentBot.avatar }];
+            setMessages([...messagesRef.current]);
+
+            if (enableAudio) {
+               setCurrentAction(`${currentBot.name} מדבר/ת...`);
+               const audioData = await callTTSAPI(apiKey, resp, currentBot.voice);
+               await playAudioAndWait(audioData, currentBot.id);
+            }
+            await checkFacts(resp, currentBot.name);
+        }
+        if (cancelDebateRef.current) break;
+      }
+
+      // --- שיפוט וסיכום ---
+      await checkPause();
+      if (!cancelDebateRef.current) {
+        setCurrentAction(`מעבד שיפוט וסיכום סופי...`);
+        const finalPrompt = `הנושא: ${topic}\n\nהיסטוריה מלאה:\n${getTranscript(messagesRef.current)}\n\nהדיבייט הסתיים. תפקידך כשופט להעריך את המשתתפים. תן לכל אחד ציון מ-1 עד 10 על בסיס רטוריקה ולוגיקה, הכרז על מנצח ברור, ונמק בקצרה (עד 60 מילים).`;
+        const resp3 = await callGeminiAPI(apiKey, "אתה שופט דיבייט אובייקטיבי ומקצועי.", finalPrompt);
+        
+        if (!cancelDebateRef.current) {
+            messagesRef.current = [...messagesRef.current, { id: Date.now(), speaker: 'שופט הדיבייט', role: 'judge', text: resp3 }];
+            setMessages([...messagesRef.current]);
+
+            if (enableAudio) {
+               setCurrentAction(`השופט מכריז על התוצאות...`);
+               const audioData = await callTTSAPI(apiKey, resp3, "Zephyr");
+               await playAudioAndWait(audioData, 'judge');
+            }
+        }
+      }
+
+      if (!cancelDebateRef.current) {
+        setDebateState('finished');
+        setCurrentAction('הדיבייט הסתיים בהצלחה.');
+      }
+    } catch (err) {
+      setDebateState('error'); setErrorMsg(err.message); setCurrentAction('הדיבייט נעצר עקב שגיאה.');
+    }
+  };
+
+  const stopDebate = () => {
+    cancelDebateRef.current = true;
+    if (currentAudioRef.current) {
+       currentAudioRef.current.pause();
+       currentAudioRef.current.dispatchEvent(new Event('stop-debate'));
+    }
+    setDebateState('finished'); setIsPaused(false); pausedRef.current = false;
+    setCurrentAction('הדיבייט הופסק.');
+  };
+
+  // --- הגדרות עיצוב (Themes) ---
+  const getThemeClasses = () => {
+    switch(theme) {
+      case 'academic': return { bg: 'bg-stone-100', header: 'bg-amber-900', botColors: ['bg-amber-700', 'bg-stone-700', 'bg-yellow-800', 'bg-neutral-600', 'bg-orange-800'], text: 'text-stone-900' };
+      case 'cyber': return { bg: 'bg-slate-900', header: 'bg-black', botColors: ['bg-indigo-900 border border-indigo-500', 'bg-teal-900 border border-teal-500', 'bg-fuchsia-900 border border-fuchsia-500', 'bg-cyan-900 border border-cyan-500', 'bg-violet-900 border border-violet-500'], text: 'text-gray-100' };
+      default: return { bg: 'bg-slate-50', header: 'bg-slate-800', botColors: ['bg-blue-600', 'bg-emerald-600', 'bg-purple-600', 'bg-amber-600', 'bg-rose-600'], text: 'text-gray-800' };
+    }
+  };
+  const tClass = getThemeClasses();
+
+  return (
+    <div className={`flex flex-col h-screen ${tClass.bg} ${tClass.text} transition-colors duration-500`} dir="rtl" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      
+      {/* כותרת עליונה */}
+      <header className={`${tClass.header} text-white p-4 shadow-md flex flex-wrap justify-between items-center z-20 shrink-0 gap-4 transition-colors duration-500`}>
+        <div className="flex items-center gap-3">
+          {theme === 'cyber' ? <Cpu className="w-6 h-6 text-teal-400" /> : <Scale className="w-6 h-6 text-amber-400" />}
+          <h1 className="text-xl font-bold">זירת דיבייט AI</h1>
+        </div>
+        
+        <div className="flex gap-2">
+          {messages.length > 0 && (
+            <button onClick={exportTranscript} className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-white/10 transition-colors text-sm font-medium">
+              <Download className="w-4 h-4" /> <span className="hidden sm:inline">הורד תמליל</span>
+            </button>
+          )}
+          {messages.length > 0 && (
+            <button onClick={clearHistory} className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-white/10 transition-colors text-sm font-medium text-red-200">
+              <RotateCcw className="w-4 h-4" /> <span className="hidden sm:inline">נקה היסטוריה</span>
+            </button>
+          )}
+          <button onClick={() => setShowSettings(!showSettings)} className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${showSettings ? 'bg-white/20' : 'hover:bg-white/10'}`}>
+            <Settings className="w-5 h-5" /> <span className="hidden sm:inline">הגדרות מתקדמות</span>
+          </button>
+        </div>
+      </header>
+
+      {/* סרגל התקדמות */}
+      {(debateState === 'running' || debateState === 'paused') && (
+        <div className="w-full bg-gray-200 h-1.5 shrink-0">
+          <div className="bg-blue-500 h-1.5 transition-all duration-500" style={{ width: `${(currentRound / maxTurns) * 100}%` }}></div>
+        </div>
+      )}
+
+      <div className="flex flex-1 overflow-hidden relative">
+        <main className="flex-1 flex flex-col relative">
+          
+          {/* חלונית הגדרות */}
+          <div className={`absolute top-0 left-0 right-0 bg-white shadow-2xl border-b border-gray-200 z-30 transition-transform duration-300 transform origin-top ${showSettings ? 'scale-y-100 opacity-100' : 'scale-y-0 opacity-0 h-0 overflow-hidden'} text-gray-800`}>
+            <div className="p-6 max-h-[70vh] overflow-y-auto">
+              <div className="flex justify-between items-center border-b pb-3 mb-4">
+                 <h2 className="text-xl font-bold flex items-center gap-2"><Settings className="w-6 h-6 text-blue-600"/> תצורת הזירה</h2>
+              </div>
+              
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                {/* צד ימין - הגדרות כלליות */}
+                <div className="space-y-5">
+                  <div className="bg-gray-50 p-4 rounded-xl border border-gray-100">
+                    <label className="block text-sm font-bold mb-2">נושא הדיבייט</label>
+                    <input type="text" value={topic} onChange={e => setTopic(e.target.value)} disabled={debateState === 'running' || debateState === 'paused'}
+                      className="w-full p-2.5 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none shadow-sm" />
+                  </div>
+                  
+                  <div className="flex gap-4">
+                    <div className="flex-1">
+                      <label className="block text-sm font-bold mb-2">מספר סיבובים</label>
+                      <input type="number" min="1" max="10" value={maxTurns} onChange={e => setMaxTurns(parseInt(e.target.value))} disabled={debateState === 'running' || debateState === 'paused'}
+                        className="w-full p-2 border rounded-lg outline-none text-center" />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-sm font-bold mb-2">מגבלת מילים (לסיבוב)</label>
+                      <input type="number" min="10" max="500" value={wordLimit} onChange={e => setWordLimit(parseInt(e.target.value))} disabled={debateState === 'running' || debateState === 'paused'}
+                        className="w-full p-2 border rounded-lg outline-none text-center" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-bold mb-2">חוקי הדיבייט (אופציונלי)</label>
+                    <textarea value={customRules} onChange={e => setCustomRules(e.target.value)} placeholder="לדוגמה: חובה לפנות ליריב בכבוד..." rows="2" disabled={debateState === 'running' || debateState === 'paused'}
+                      className="w-full p-2 border rounded-lg outline-none resize-none text-sm"></textarea>
+                  </div>
+
+                  <div className="space-y-3 pt-2 border-t">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-bold flex items-center gap-2"><Volume2 className="w-5 h-5 text-blue-600"/> הפעל דיבור קולי (TTS)</label>
+                      <input type="checkbox" checked={enableAudio} onChange={e => setEnableAudio(e.target.checked)} disabled={debateState === 'running' || debateState === 'paused'} className="w-5 h-5 accent-blue-600" />
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-bold flex items-center gap-2"><CheckCircle className="w-5 h-5 text-green-600"/> סוכן בדיקת עובדות בזמן אמת</label>
+                      <input type="checkbox" checked={enableFactCheck} onChange={e => setEnableFactCheck(e.target.checked)} disabled={debateState === 'running' || debateState === 'paused'} className="w-5 h-5 accent-green-600" />
+                    </div>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-bold mb-2">סגנון זירה (Theme)</label>
+                    <select value={theme} onChange={e => setTheme(e.target.value)} className="w-full p-2 border rounded-lg bg-white">
+                      <option value="classic">קלאסי (מודרני ונקי)</option>
+                      <option value="academic">אולם אקדמי / משפט (רשמי)</option>
+                      <option value="cyber">סייבר ועתידנות (כהה)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-bold mb-1 flex items-center gap-2"><Key className="w-4 h-4"/> מפתח API</label>
+                    <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="השאר ריק אם מוגדר בסביבה"
+                      className="w-full p-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none font-mono text-xs" />
+                  </div>
+                </div>
+
+                {/* צד שמאל - פאנל דמויות */}
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center mb-2">
+                    <label className="text-sm font-bold text-gray-800 flex items-center gap-2"><Users className="w-5 h-5"/> משתתפי הפאנל ({bots.length})</label>
+                    <button onClick={addBot} disabled={debateState === 'running' || debateState === 'paused' || bots.length >= 5} className="text-sm bg-blue-100 text-blue-700 px-3 py-1.5 rounded-lg flex items-center gap-1 hover:bg-blue-200 disabled:opacity-50 font-bold">
+                      <Plus className="w-4 h-4" /> הוסף דובר
+                    </button>
+                  </div>
+                  
+                  <div className="max-h-[50vh] overflow-y-auto pr-2 space-y-4 scrollbar-thin">
+                    {bots.map((bot, index) => {
+                      const themeColor = tClass.botColors[bot.colorIndex % tClass.botColors.length].split(' ')[0].replace('bg-', 'text-');
+                      return (
+                      <div key={bot.id} className="p-5 bg-white rounded-xl border border-gray-200 shadow-sm relative group">
+                        {bots.length > 2 && (
+                          <button onClick={() => removeBot(bot.id)} disabled={debateState === 'running' || debateState === 'paused'} className="absolute top-3 left-3 text-red-300 hover:text-red-600 transition-colors">
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
+                        <div className="flex gap-2 mb-3 items-center">
+                           <div className={`w-3 h-3 rounded-full ${tClass.botColors[bot.colorIndex % tClass.botColors.length].split(' ')[0]}`}></div>
+                           <span className={`font-bold text-sm ${themeColor}`}>דובר {index + 1}</span>
+                        </div>
+                        <div className="flex gap-2 mb-3">
+                          <input type="text" value={bot.name} onChange={e => updateBot(bot.id, 'name', e.target.value)} disabled={debateState === 'running' || debateState === 'paused'}
+                            className="flex-1 p-2 border rounded-lg bg-gray-50 font-medium text-gray-900" placeholder="שם הדובר" />
+                          <select value={bot.voice} onChange={e => updateBot(bot.id, 'voice', e.target.value)} disabled={debateState === 'running' || debateState === 'paused'} className="w-24 p-2 border rounded-lg bg-gray-50 text-sm outline-none text-gray-900">
+                            <option value="Aoede">קול 1</option><option value="Fenrir">קול 2</option><option value="Kore">קול 3</option>
+                          </select>
+                        </div>
+                        <div className="flex gap-2 mb-3">
+                          <div className="flex-1 relative">
+                             <ImageIcon className="w-4 h-4 absolute right-3 top-3 text-gray-400" />
+                             <input type="text" value={bot.avatar || ''} onChange={e => updateBot(bot.id, 'avatar', e.target.value)} disabled={debateState === 'running' || debateState === 'paused'}
+                               className="w-full p-2 pr-9 border rounded-lg bg-gray-50 text-sm text-gray-900" placeholder="URL לתמונה אישית (אופציונלי)" dir="ltr" />
+                          </div>
+                        </div>
+                        <textarea value={bot.persona} onChange={e => updateBot(bot.id, 'persona', e.target.value)} placeholder="הגדרת אישיות ותפיסת עולם..." rows="3" disabled={debateState === 'running' || debateState === 'paused'}
+                          className="w-full p-2 border rounded-lg text-sm resize-none bg-gray-50 text-gray-900"></textarea>
+                      </div>
+                    )})}
+                  </div>
+                </div>
+
+              </div>
+              <div className="mt-6 flex justify-end border-t pt-4">
+                <button onClick={() => setShowSettings(false)} className="bg-slate-800 text-white px-8 py-2.5 rounded-lg hover:bg-slate-700 font-bold shadow-md">סגור הגדרות ושמור</button>
+              </div>
+            </div>
+          </div>
+
+          {/* הודעת נושא ברקע */}
+          <div className="px-6 py-4 shadow-sm flex items-center justify-between shrink-0 bg-white/5 backdrop-blur-sm border-b border-black/10">
+             <div>
+                <span className="text-xs uppercase tracking-wider opacity-70 font-bold block mb-1">נושא הדיבייט הרשמי</span>
+                <span className="text-lg font-bold">{topic}</span>
+             </div>
+             <div className="hidden md:flex flex-wrap items-center gap-2 text-sm px-4 py-2 rounded-full bg-black/5 font-medium max-w-lg justify-end">
+               <Users className="w-4 h-4 opacity-70" />
+               {bots.map((bot, idx) => (
+                  <React.Fragment key={bot.id}>
+                    <span>{bot.name}</span>
+                    {idx < bots.length - 1 && <span className="text-red-500 font-bold px-1 text-xs">VS</span>}
+                  </React.Fragment>
+               ))}
+             </div>
+          </div>
+
+          {/* אזור הצ'אט / הדיבייט */}
+          <div ref={chatContainerRef} className={`flex-1 overflow-y-auto p-4 md:p-8 space-y-8 ${theme === 'cyber' ? 'scrollbar-dark' : ''}`}>
+            {messages.length === 0 && debateState === 'idle' && (
+              <div className="h-full flex flex-col items-center justify-center opacity-40">
+                <Scale className="w-20 h-20 mb-6" />
+                <h2 className="text-2xl font-bold mb-2">הזירה מוכנה</h2>
+                <p className="text-lg text-center max-w-md">הגדר את הדמויות והנושא בחלונית ההגדרות, ולחץ על התחל דיבייט כשתהיה מוכן.</p>
+              </div>
+            )}
+            
+            {messages.map((msg) => {
+              const botData = bots.find(b => b.id === msg.role);
+              const botColorClass = botData ? tClass.botColors[botData.colorIndex % tClass.botColors.length] : 'bg-gray-600';
+              const isBot = msg.role.startsWith('bot');
+              const alignLeft = botData ? botData.colorIndex % 2 !== 0 : false;
+              
+              return (
+              <div key={msg.id} className={`flex w-full ${!isBot ? 'justify-center' : (!alignLeft ? 'justify-start' : 'justify-end')}`}>
+                <div className={`
+                  relative max-w-[90%] md:max-w-[70%] rounded-2xl p-5 shadow-lg
+                  ${isBot ? `${botColorClass} text-white` : ''}
+                  ${isBot && !alignLeft ? 'rounded-tr-sm' : ''}
+                  ${isBot && alignLeft ? 'rounded-tl-sm' : ''}
+                  ${msg.role === 'judge' ? 'bg-amber-100 text-amber-900 border-2 border-amber-300 text-center w-full md:w-4/5 shadow-xl' : ''}
+                  ${msg.role === 'fact_check' ? 'bg-red-50 text-red-900 border-l-4 border-red-500 shadow-md w-full md:w-3/4' : ''}
+                  ${msg.role === 'user_moderator' ? 'bg-purple-100 text-purple-900 border border-purple-200 text-center shadow-md w-full md:w-2/3' : ''}
+                `}>
+                  <div className={`text-sm font-bold mb-3 flex items-center gap-3 opacity-90 ${!isBot ? 'justify-center' : ''}`}>
+                    {isBot && msg.avatar ? (
+                       <img src={msg.avatar} alt={msg.speaker} className="w-8 h-8 rounded-full object-cover border-2 border-white/30 bg-black/10" 
+                            onError={(e) => { e.target.onerror = null; e.target.src = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxwYXRoIGQ9Ik0yMCAyMXYtMmE0IDQgMCAwIDAtNC00SDhhNCA0IDAgMCAwLTQgNHYyIj48L3BhdGg+PGNpcmNsZSBjeD0iMTIiIGN5PSI3IiByPSI0Ij48L2NpcmNsZT48L3N2Zz4='; }} />
+                    ) : isBot ? (
+                       <div className="w-8 h-8 rounded-full bg-white/20 flex items-center justify-center"><User className="w-4 h-4" /></div>
+                    ) : null}
+                    
+                    {msg.role === 'fact_check' && <ShieldAlert className="w-5 h-5 text-red-600" />}
+                    {msg.role === 'user_moderator' && <Navigation className="w-4 h-4 text-purple-700" />}
+                    {msg.role === 'judge' && <Scale className="w-5 h-5 text-amber-700" />}
+                    <span className="text-lg">{msg.speaker}</span>
+                    
+                    {/* אנימציית דיבור (Visualizer) */}
+                    {speakingBot === msg.role && enableAudio && (
+                      <div className="flex items-center gap-1 ml-2 h-4 text-white opacity-90">
+                        <div className="bar"></div><div className="bar"></div><div className="bar"></div><div className="bar"></div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="leading-relaxed whitespace-pre-wrap text-base">
+                    {msg.text}
+                  </div>
+                </div>
+              </div>
+            )})}
+            
+            {errorMsg && (
+              <div className="bg-red-100 border-2 border-red-400 text-red-800 p-4 rounded-xl flex items-center gap-3 shadow-lg mx-auto max-w-2xl">
+                 <ShieldAlert className="w-8 h-8 shrink-0" />
+                 <p className="font-bold">{errorMsg}</p>
+              </div>
+            )}
+          </div>
+
+          {/* שורת הכוונת קהל / מנחה */}
+          <div className="bg-white/10 backdrop-blur-md border-t border-black/10 p-3 flex items-center gap-3 shrink-0 z-10">
+            <input
+               type="text"
+               value={userInput}
+               onChange={e => setUserInput(e.target.value)}
+               onKeyDown={e => e.key === 'Enter' && handleSendUserMessage()}
+               placeholder="התערבות קהל / שאלת מנחה מתפרצת..."
+               className="flex-1 p-3 bg-white/80 border border-transparent rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-sm md:text-base text-gray-900"
+               disabled={debateState === 'idle' || debateState === 'finished'}
+            />
+            <button
+               onClick={handleSendUserMessage}
+               disabled={!userInput.trim() || debateState === 'idle' || debateState === 'finished'}
+               className="bg-blue-600 text-white px-4 md:px-6 py-3 rounded-xl hover:bg-blue-700 disabled:opacity-50 font-bold transition-colors flex items-center gap-2 shadow-md"
+            >
+               <Navigation className="w-4 h-4 hidden sm:block" />
+               <span>שלח התערבות</span>
+            </button>
+          </div>
+
+          {/* פקדים תחתונים */}
+          <div className="bg-black/5 border-t border-black/10 p-4 flex flex-col sm:flex-row items-center justify-between gap-4 shrink-0">
+            <div className="flex items-center gap-3 text-sm font-bold bg-white/80 text-gray-800 px-5 py-2.5 rounded-full w-full sm:w-auto shadow-sm">
+               <div className={`w-2.5 h-2.5 rounded-full ${debateState === 'running' ? 'bg-green-500 animate-pulse' : (debateState === 'paused' ? 'bg-amber-500' : 'bg-gray-400')}`}></div>
+               {currentAction}
+            </div>
+            
+            <div className="flex gap-3 w-full sm:w-auto">
+              {debateState === 'idle' || debateState === 'finished' || debateState === 'error' ? (
+                <button 
+                  onClick={runDebate}
+                  className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-blue-600 text-white px-8 py-3 rounded-xl hover:bg-blue-700 transition-all font-bold shadow-lg"
+                >
+                  <Play className="w-5 h-5 fill-current" />
+                  התחל דיבייט חדש
+                </button>
+              ) : (
+                <>
+                  <button 
+                    onClick={togglePause}
+                    className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-amber-500 text-white px-6 py-3 rounded-xl hover:bg-amber-600 transition-all font-bold shadow-md"
+                  >
+                    {isPaused ? <Play className="w-5 h-5 fill-current" /> : <Pause className="w-5 h-5 fill-current" />}
+                    {isPaused ? 'המשך דיבייט' : 'השהה ניווט'}
+                  </button>
+                  <button 
+                    onClick={stopDebate}
+                    className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-red-500 text-white px-6 py-3 rounded-xl hover:bg-red-600 transition-all font-bold shadow-md"
+                  >
+                    <Square className="w-5 h-5 fill-current" />
+                    סיום מוקדם
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+        </main>
+      </div>
+    </div>
+  );
+}
